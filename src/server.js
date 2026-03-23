@@ -65,11 +65,39 @@ export default {
    * @returns {Promise<void>}
    */
   async email(message, env, ctx) {
+    // 调试：确认 email() 入口被触发
+    try {
+      await env.TEMP_MAIL_DB.prepare(
+        "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+      ).bind(
+        "email_enter",
+        "worker email event triggered"
+      ).run();
+    } catch (_) {}
+
     // 获取数据库连接
     let DB;
     try {
       DB = await getInitializedDatabase(env);
+
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_db_ok",
+          "database connected"
+        ).run();
+      } catch (_) {}
     } catch (error) {
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_db_error",
+          String(error && error.stack ? error.stack : error)
+        ).run();
+      } catch (_) {}
+
       console.error('邮件处理时数据库连接失败:', error.message);
       return;
     }
@@ -80,6 +108,15 @@ export default {
       const toHeader = headers.get('to') || headers.get('To') || '';
       const fromHeader = headers.get('from') || headers.get('From') || '';
       const subject = headers.get('subject') || headers.get('Subject') || '(无主题)';
+
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_headers_ok",
+          JSON.stringify({ toHeader, fromHeader, subject }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
 
       // 解析收件人地址
       let envelopeTo = '';
@@ -95,6 +132,15 @@ export default {
       const resolvedRecipient = (envelopeTo || toHeader || '').toString();
       const resolvedRecipientAddr = extractEmail(resolvedRecipient);
       const localPart = (resolvedRecipientAddr.split('@')[0] || '').toLowerCase();
+
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_recipient_resolved",
+          JSON.stringify({ envelopeTo, resolvedRecipient, resolvedRecipientAddr, localPart }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
 
       // 处理邮件转发（优先使用邮箱配置，否则使用全局规则）
       const mailboxForwardTo = await getForwardTarget(DB, resolvedRecipientAddr);
@@ -124,8 +170,16 @@ export default {
       const mailbox = extractEmail(resolvedRecipient || toHeader);
       const sender = extractEmail(fromHeader);
 
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_mailbox_sender",
+          JSON.stringify({ mailbox, sender }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
+
       // （D1-only）不存 R2：不写入完整 EML，只保留验证码/预览到 D1
-      // const r2 = env.MAIL_EML;
       let objectKey = '';
       try {
         // 保持 objectKey 为空即可
@@ -140,6 +194,15 @@ export default {
       try {
         verificationCode = extractVerificationCode({ subject, text: textContent, html: htmlContent });
       } catch (_) { }
+
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_preview_code",
+          JSON.stringify({ preview, verificationCode }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
 
       // 存储到数据库
       const resMb = await DB.prepare('SELECT id FROM mailboxes WHERE address = ?').bind(mailbox.toLowerCase()).all();
@@ -157,6 +220,15 @@ export default {
       }
       if (!mailboxId) throw new Error('无法解析或创建 mailbox 记录');
 
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_mailbox_id_ok",
+          JSON.stringify({ mailbox, mailboxId }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
+
       // 解析收件人列表
       let toAddrs = '';
       try {
@@ -172,6 +244,15 @@ export default {
         toAddrs = resolvedRecipient || toHeader || '';
       }
 
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_before_insert",
+          JSON.stringify({ mailboxId, sender, toAddrs, subject }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
+
       // 插入消息记录
       await DB.prepare(`
         INSERT INTO messages (mailbox_id, sender, to_addrs, subject, verification_code, preview, r2_bucket, r2_object_key)
@@ -186,7 +267,25 @@ export default {
         objectKey ? 'mail-eml' : null,
         objectKey || ''
       ).run();
+
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_insert_success",
+          JSON.stringify({ mailbox, mailboxId, subject }).slice(0, 1000)
+        ).run();
+      } catch (_) {}
     } catch (err) {
+      try {
+        await env.TEMP_MAIL_DB.prepare(
+          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        ).bind(
+          "email_error",
+          String(err && err.stack ? err.stack : err)
+        ).run();
+      } catch (_) {}
+
       console.error('Email event handling error:', err);
     }
   }
