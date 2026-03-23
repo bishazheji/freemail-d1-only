@@ -1,292 +1,316 @@
 /**
- * Freemail 主入口文件
- * 
- * 本文件作为 Cloudflare Worker 的入口点，负责：
- * 1. 处理 HTTP 请求（通过 fetch 处理器）
- * 2. 处理邮件接收（通过 email 处理器）
- * 
- * 所有具体业务逻辑已拆分到各个子模块中
- * 
- * @module server
+ * 路由配置模块
+ * @module routes
  */
 
-import { initDatabase, getInitializedDatabase } from './db/index.js';
-import { createRouter, authMiddleware } from './routes/index.js';
-import { createAssetManager } from './assets/index.js';
-import { extractEmail } from './utils/common.js';
-import { forwardByLocalPart, forwardByMailboxConfig } from './email/forwarder.js';
-import { parseEmailBody, extractVerificationCode } from './email/parser.js';
-import { getForwardTarget } from './db/mailboxes.js';
+import { Router, createJwt, buildSessionCookie, verifyMailboxLogin, authMiddleware } from '../middleware/index.js';
+import { handleApiRequest } from '../api/index.js';
+import { getDatabaseWithValidation } from '../db/index.js';
+import { verifyPassword } from '../utils/common.js';
+import { handleEmailReceive } from '../email/receiver.js';
 
-export default {
-  /**
-   * HTTP请求处理器
-   * @param {Request} request - HTTP请求对象
-   * @param {object} env - 环境变量对象
-   * @param {object} ctx - 上下文对象
-   * @returns {Promise<Response>} HTTP响应对象
-   */
-  async fetch(request, env, ctx) {
-    // 获取数据库连接
+/**
+ * 创建并配置路由器
+ * @returns {Router} 配置好的路由器实例
+ */
+export function createRouter() {
+  const router = new Router();
+
+  // =================== 认证相关路由 ===================
+  router.post('/api/login', async (context) => {
+    const { request, env } = context;
     let DB;
     try {
-      DB = await getInitializedDatabase(env);
+      DB = await getDatabaseWithValidation(env);
     } catch (error) {
-      console.error('数据库连接失败:', error.message);
-      return new Response('数据库连接失败，请检查配置', { status: 500 });
+      console.error('登录时数据库连接失败:', error.message);
+      return new Response('数据库连接失败', { status: 500 });
+    }
+    const ADMIN_NAME = String(env.ADMIN_NAME || 'admin').trim().toLowerCase();
+    const ADMIN_PASSWORD = env.ADMIN_PASSWORD || env.ADMIN_PASS || '';
+    const GUEST_PASSWORD = env.GUEST_PASSWORD || '';
+    const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
+    // 从环境变量读取会话过期天数，默认7天
+    const SESSION_EXPIRE_DAYS = parseInt(env.SESSION_EXPIRE_DAYS, 10) || 7;
+
+    try {
+      const body = await request.json();
+      const name = String(body.username || '').trim().toLowerCase();
+      const password = String(body.password || '').trim();
+
+      if (!name || !password) {
+        return new Response('用户名或密码不能为空', { status: 400 });
+      }
+
+      // 1) 管理员
+      if (name === ADMIN_NAME && ADMIN_PASSWORD && password === ADMIN_PASSWORD) {
+        let adminUserId = 0;
+        try {
+          const u = await DB.prepare('SELECT id FROM users WHERE username = ?').bind(ADMIN_NAME).all();
+          if (u?.results?.length) {
+            adminUserId = Number(u.results[0].id);
+          } else {
+            await DB.prepare("INSERT INTO users (username, role, can_send, mailbox_limit) VALUES (?, 'admin', 1, 9999)").bind(ADMIN_NAME).run();
+            const again = await DB.prepare('SELECT id FROM users WHERE username = ?').bind(ADMIN_NAME).all();
+            adminUserId = Number(again?.results?.[0]?.id || 0);
+          }
+        } catch (_) {
+          adminUserId = 0;
+        }
+
+        const token = await createJwt(JWT_TOKEN, { role: 'admin', username: ADMIN_NAME, userId: adminUserId }, SESSION_EXPIRE_DAYS);
+        const headers = new Headers({ 'Content-Type': 'application/json' });
+        headers.set('Set-Cookie', buildSessionCookie(token, request.url, SESSION_EXPIRE_DAYS));
+        return new Response(JSON.stringify({ success: true, role: 'admin', can_send: 1, mailbox_limit: 9999 }), { headers });
+      }
+
+      // 2) 访客
+      if (name === 'guest' && GUEST_PASSWORD && password === GUEST_PASSWORD) {
+        const token = await createJwt(JWT_TOKEN, { role: 'guest', username: 'guest' }, SESSION_EXPIRE_DAYS);
+        const headers = new Headers({ 'Content-Type': 'application/json' });
+        headers.set('Set-Cookie', buildSessionCookie(token, request.url, SESSION_EXPIRE_DAYS));
+        return new Response(JSON.stringify({ success: true, role: 'guest' }), { headers });
+      }
+
+      // 3) 普通用户
+      try {
+        const { results } = await DB.prepare('SELECT id, password_hash, role, mailbox_limit, can_send FROM users WHERE username = ?').bind(name).all();
+        if (results && results.length) {
+          const row = results[0];
+          const ok = await verifyPassword(password, row.password_hash || '');
+          if (ok) {
+            const role = (row.role === 'admin') ? 'admin' : 'user';
+            const token = await createJwt(JWT_TOKEN, { role, username: name, userId: row.id }, SESSION_EXPIRE_DAYS);
+            const headers = new Headers({ 'Content-Type': 'application/json' });
+            headers.set('Set-Cookie', buildSessionCookie(token, request.url, SESSION_EXPIRE_DAYS));
+            const canSend = role === 'admin' ? 1 : (row.can_send ? 1 : 0);
+            const mailboxLimit = role === 'admin' ? (row.mailbox_limit || 20) : (row.mailbox_limit || 10);
+            return new Response(JSON.stringify({ success: true, role, can_send: canSend, mailbox_limit: mailboxLimit }), { headers });
+          }
+        }
+      } catch (_) {
+        // 继续尝试邮箱登录
+      }
+
+      // 4) 邮箱登录
+      try {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (emailRegex.test(name)) {
+          const mailboxInfo = await verifyMailboxLogin(name, password, DB);
+          if (mailboxInfo) {
+            const token = await createJwt(JWT_TOKEN, {
+              role: 'mailbox',
+              username: name,
+              mailboxId: mailboxInfo.id,
+              mailboxAddress: mailboxInfo.address
+            }, SESSION_EXPIRE_DAYS);
+            const headers = new Headers({ 'Content-Type': 'application/json' });
+            headers.set('Set-Cookie', buildSessionCookie(token, request.url, SESSION_EXPIRE_DAYS));
+            return new Response(JSON.stringify({
+              success: true,
+              role: 'mailbox',
+              mailbox: mailboxInfo.address,
+              can_send: 0,
+              mailbox_limit: 1
+            }), { headers });
+          }
+        }
+      } catch (_) {
+        // 继续
+      }
+
+      return new Response('用户名或密码错误', { status: 401 });
+    } catch (_) {
+      return new Response('Bad Request', { status: 400 });
+    }
+  });
+
+  router.post('/api/logout', async (context) => {
+    const { request } = context;
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+
+    try {
+      const u = new URL(request.url);
+      const isHttps = (u.protocol === 'https:');
+      const secureFlag = isHttps ? ' Secure;' : '';
+      headers.set('Set-Cookie', `iding-session=; HttpOnly;${secureFlag} Path=/; SameSite=Strict; Max-Age=0`);
+    } catch (_) {
+      headers.set('Set-Cookie', 'iding-session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0');
     }
 
-    // 解析邮件域名
-    const MAIL_DOMAINS = (env.MAIL_DOMAIN || 'temp.example.com')
-      .split(/[,\s]+/)
-      .map(d => d.trim())
-      .filter(Boolean);
+    return new Response(JSON.stringify({ success: true }), { headers });
+  });
 
-    // 创建路由器并添加认证中间件
-    const router = createRouter();
-    router.use(authMiddleware);
+  router.get('/api/session', async (context) => {
+    const { request, env, authPayload } = context;
+    const ADMIN_NAME = String(env.ADMIN_NAME || 'admin').trim().toLowerCase();
 
-    // 尝试使用路由器处理请求
-    const routeResponse = await router.handle(request, { request, env, ctx });
-    if (routeResponse) {
-      return routeResponse;
+    if (!authPayload) {
+      return new Response('Unauthorized', { status: 401 });
     }
 
-    // 使用资源管理器处理静态资源请求
-    const assetManager = createAssetManager();
-    return await assetManager.handleAssetRequest(request, env, MAIL_DOMAINS);
-  },
+    const strictAdmin = (authPayload.role === 'admin') && (
+      String(authPayload.username || '').trim().toLowerCase() === ADMIN_NAME ||
+      String(authPayload.username || '') === '__root__'
+    );
 
-  /**
-   * 邮件接收处理器
-   * @param {object} message - 邮件消息对象
-   * @param {object} env - 环境变量对象
-   * @param {object} ctx - 上下文对象
-   * @returns {Promise<void>}
-   */
-  async email(message, env, ctx) {
-    // 调试：确认 email() 入口被触发
+    const response = {
+      authenticated: true,
+      role: authPayload.role || 'admin',
+      username: authPayload.username || '',
+      strictAdmin
+    };
+
+    // 邮箱用户返回邮箱地址
+    if (authPayload.role === 'mailbox' && authPayload.mailboxAddress) {
+      response.mailboxAddress = authPayload.mailboxAddress;
+    }
+
+    return Response.json(response);
+  });
+
+  // =================== API路由委托 ===================
+  router.get('/api/*', async (context) => {
+    return await delegateApiRequest(context);
+  });
+
+  router.post('/api/*', async (context) => {
+    return await delegateApiRequest(context);
+  });
+
+  router.patch('/api/*', async (context) => {
+    return await delegateApiRequest(context);
+  });
+
+  router.put('/api/*', async (context) => {
+    return await delegateApiRequest(context);
+  });
+
+  router.delete('/api/*', async (context) => {
+    return await delegateApiRequest(context);
+  });
+
+  // =================== 邮件接收路由 ===================
+  router.post('/receive', async (context) => {
+    const { request, env, authPayload } = context;
+
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_enter',
+      'worker triggered'
+    ).run();
+
+    if (authPayload === false) {
+      await env.TEMP_MAIL_DB.prepare(
+        `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+      ).bind(
+        'receive_unauthorized',
+        'authPayload === false'
+      ).run();
+
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    let DB;
+    try {
+      DB = await getDatabaseWithValidation(env);
+
+      await env.TEMP_MAIL_DB.prepare(
+        `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+      ).bind(
+        'receive_db_ok',
+        'database connected'
+      ).run();
+    } catch (error) {
+      await env.TEMP_MAIL_DB.prepare(
+        `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+      ).bind(
+        'receive_db_error',
+        String(error && error.stack ? error.stack : error)
+      ).run();
+
+      console.error('邮件接收时数据库连接失败:', error.message);
+      return new Response('数据库连接失败', { status: 500 });
+    }
+
     try {
       await env.TEMP_MAIL_DB.prepare(
-        "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
+        `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
       ).bind(
-        "email_enter",
-        "worker email event triggered"
+        'receive_before_handler',
+        'calling handleEmailReceive'
       ).run();
-    } catch (_) {}
 
-    // 获取数据库连接
-    let DB;
-    try {
-      DB = await getInitializedDatabase(env);
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_db_ok",
-          "database connected"
-        ).run();
-      } catch (_) {}
+      return await handleEmailReceive(request, DB, env);
     } catch (error) {
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_db_error",
-          String(error && error.stack ? error.stack : error)
-        ).run();
-      } catch (_) {}
-
-      console.error('邮件处理时数据库连接失败:', error.message);
-      return;
-    }
-
-    try {
-      // 解析邮件头部
-      const headers = message.headers;
-      const toHeader = headers.get('to') || headers.get('To') || '';
-      const fromHeader = headers.get('from') || headers.get('From') || '';
-      const subject = headers.get('subject') || headers.get('Subject') || '(无主题)';
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_headers_ok",
-          JSON.stringify({ toHeader, fromHeader, subject }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // 解析收件人地址
-      let envelopeTo = '';
-      try {
-        const toValue = message.to;
-        if (Array.isArray(toValue) && toValue.length > 0) {
-          envelopeTo = typeof toValue[0] === 'string' ? toValue[0] : (toValue[0].address || '');
-        } else if (typeof toValue === 'string') {
-          envelopeTo = toValue;
-        }
-      } catch (_) { }
-
-      const resolvedRecipient = (envelopeTo || toHeader || '').toString();
-      const resolvedRecipientAddr = extractEmail(resolvedRecipient);
-      const localPart = (resolvedRecipientAddr.split('@')[0] || '').toLowerCase();
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_recipient_resolved",
-          JSON.stringify({ envelopeTo, resolvedRecipient, resolvedRecipientAddr, localPart }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // 处理邮件转发（优先使用邮箱配置，否则使用全局规则）
-      const mailboxForwardTo = await getForwardTarget(DB, resolvedRecipientAddr);
-      if (mailboxForwardTo) {
-        forwardByMailboxConfig(message, mailboxForwardTo, ctx);
-      } else {
-        forwardByLocalPart(message, localPart, ctx, env);
-      }
-
-      // 读取原始邮件内容
-      let textContent = '';
-      let htmlContent = '';
-      let rawBuffer = null;
-      try {
-        const resp = new Response(message.raw);
-        rawBuffer = await resp.arrayBuffer();
-        const rawText = await new Response(rawBuffer).text();
-        const parsed = parseEmailBody(rawText);
-        textContent = parsed.text || '';
-        htmlContent = parsed.html || '';
-        if (!textContent && !htmlContent) textContent = (rawText || '').slice(0, 100000);
-      } catch (_) {
-        textContent = '';
-        htmlContent = '';
-      }
-
-      const mailbox = extractEmail(resolvedRecipient || toHeader);
-      const sender = extractEmail(fromHeader);
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_mailbox_sender",
-          JSON.stringify({ mailbox, sender }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // （D1-only）不存 R2：不写入完整 EML，只保留验证码/预览到 D1
-      let objectKey = '';
-      try {
-        // 保持 objectKey 为空即可
-      } catch (_) {}
-
-      // 生成预览和验证码
-      const preview = (() => {
-        const plain = textContent && textContent.trim() ? textContent : (htmlContent || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        return String(plain || '').slice(0, 120);
-      })();
-      let verificationCode = '';
-      try {
-        verificationCode = extractVerificationCode({ subject, text: textContent, html: htmlContent });
-      } catch (_) { }
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_preview_code",
-          JSON.stringify({ preview, verificationCode }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // 存储到数据库
-      const resMb = await DB.prepare('SELECT id FROM mailboxes WHERE address = ?').bind(mailbox.toLowerCase()).all();
-      let mailboxId;
-      if (Array.isArray(resMb?.results) && resMb.results.length) {
-        mailboxId = resMb.results[0].id;
-      } else {
-        const [localPartMb, domain] = (mailbox || '').toLowerCase().split('@');
-        if (localPartMb && domain) {
-          await DB.prepare('INSERT INTO mailboxes (address, local_part, domain, password_hash, last_accessed_at) VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP)')
-            .bind((mailbox || '').toLowerCase(), localPartMb, domain).run();
-          const created = await DB.prepare('SELECT id FROM mailboxes WHERE address = ?').bind((mailbox || '').toLowerCase()).all();
-          mailboxId = created?.results?.[0]?.id;
-        }
-      }
-      if (!mailboxId) throw new Error('无法解析或创建 mailbox 记录');
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_mailbox_id_ok",
-          JSON.stringify({ mailbox, mailboxId }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // 解析收件人列表
-      let toAddrs = '';
-      try {
-        const toValue = message.to;
-        if (Array.isArray(toValue)) {
-          toAddrs = toValue.map(v => (typeof v === 'string' ? v : (v?.address || ''))).filter(Boolean).join(',');
-        } else if (typeof toValue === 'string') {
-          toAddrs = toValue;
-        } else {
-          toAddrs = resolvedRecipient || toHeader || '';
-        }
-      } catch (_) {
-        toAddrs = resolvedRecipient || toHeader || '';
-      }
-
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_before_insert",
-          JSON.stringify({ mailboxId, sender, toAddrs, subject }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-
-      // 插入消息记录
-      await DB.prepare(`
-        INSERT INTO messages (mailbox_id, sender, to_addrs, subject, verification_code, preview, r2_bucket, r2_object_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        mailboxId,
-        sender,
-        String(toAddrs || ''),
-        subject || '(无主题)',
-        verificationCode || null,
-        preview || null,
-        objectKey ? 'mail-eml' : null,
-        objectKey || ''
+      await env.TEMP_MAIL_DB.prepare(
+        `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+      ).bind(
+        'receive_handler_error',
+        String(error && error.stack ? error.stack : error)
       ).run();
 
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_insert_success",
-          JSON.stringify({ mailbox, mailboxId, subject }).slice(0, 1000)
-        ).run();
-      } catch (_) {}
-    } catch (err) {
-      try {
-        await env.TEMP_MAIL_DB.prepare(
-          "INSERT INTO debug_events (stage, detail) VALUES (?, ?)"
-        ).bind(
-          "email_error",
-          String(err && err.stack ? err.stack : err)
-        ).run();
-      } catch (_) {}
-
-      console.error('Email event handling error:', err);
+      throw error;
     }
+  });
+
+  return router;
+}
+
+/**
+ * 委托API请求到处理器
+ * @param {object} context - 请求上下文
+ * @returns {Promise<Response>} HTTP响应
+ */
+async function delegateApiRequest(context) {
+  const { request, env, authPayload } = context;
+  let DB;
+  try {
+    DB = await getDatabaseWithValidation(env);
+  } catch (error) {
+    console.error('API请求时数据库连接失败:', error.message);
+    return new Response('数据库连接失败', { status: 500 });
   }
-};
+
+  const MAIL_DOMAINS = (env.MAIL_DOMAIN || 'temp.example.com')
+    .split(/[,\s]+/)
+    .map(d => d.trim())
+    .filter(Boolean);
+
+  const RESEND_API_KEY = env.RESEND_API_KEY || env.RESEND_TOKEN || env.RESEND || '';
+  const ADMIN_NAME = String(env.ADMIN_NAME || 'admin').trim().toLowerCase();
+
+  // 访客只允许读取模拟数据
+  if ((authPayload.role || 'admin') === 'guest') {
+    return handleApiRequest(request, DB, MAIL_DOMAINS, {
+      mockOnly: true,
+      resendApiKey: RESEND_API_KEY,
+      adminName: ADMIN_NAME,
+      r2: env.MAIL_EML || null,
+      authPayload
+    });
+  }
+
+  // 邮箱用户只能访问自己的邮箱数据
+  if (authPayload.role === 'mailbox') {
+    return handleApiRequest(request, DB, MAIL_DOMAINS, {
+      mockOnly: false,
+      resendApiKey: RESEND_API_KEY,
+      adminName: ADMIN_NAME,
+      r2: env.MAIL_EML || null,
+      authPayload,
+      mailboxOnly: true
+    });
+  }
+
+  return handleApiRequest(request, DB, MAIL_DOMAINS, {
+    mockOnly: false,
+    resendApiKey: RESEND_API_KEY,
+    adminName: ADMIN_NAME,
+    r2: env.MAIL_EML || null,
+    authPayload
+  });
+}
+
+export { authMiddleware };
