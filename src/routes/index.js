@@ -190,30 +190,72 @@ export function createRouter() {
     return await delegateApiRequest(context);
   });
 
-  // =================== 邮件接收路由 ===================
-  router.post('/receive', async (context) => {
-    const { request, env, authPayload } = context;
+router.post('/receive', async (context) => {
+  const { request, env, authPayload } = context;
 
-    if (authPayload === false) {
-      return new Response('Unauthorized', { status: 401 });
-    }
+  await env.TEMP_MAIL_DB.prepare(
+    `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+  ).bind(
+    'receive_enter',
+    'worker triggered'
+  ).run();
 
-    let DB;
-    try {
-      DB = await getDatabaseWithValidation(env);
-    } catch (error) {
-      console.error('邮件接收时数据库连接失败:', error.message);
-      return new Response('数据库连接失败', { status: 500 });
-    }
+  if (authPayload === false) {
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_unauthorized',
+      'authPayload === false'
+    ).run();
 
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  let DB;
+  try {
+    DB = await getDatabaseWithValidation(env);
+
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_db_ok',
+      'database connected'
+    ).run();
+
+  } catch (error) {
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_db_error',
+      String(error && error.stack ? error.stack : error)
+    ).run();
+
+    console.error('邮件接收时数据库连接失败:', error.message);
+    return new Response('数据库连接失败', { status: 500 });
+  }
+
+  try {
     const { handleEmailReceive } = await import('../email/receiver.js');
-    return handleEmailReceive(request, DB, env);
-  });
 
-  return router;
-}
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_before_handler',
+      'calling handleEmailReceive'
+    ).run();
 
-/**
+    return await handleEmailReceive(request, DB, env);
+  } catch (error) {
+    await env.TEMP_MAIL_DB.prepare(
+      `INSERT INTO debug_events (stage, detail) VALUES (?, ?)`
+    ).bind(
+      'receive_handler_error',
+      String(error && error.stack ? error.stack : error)
+    ).run();
+
+    throw error;
+  }
+});
  * 委托API请求到处理器
  * @param {object} context - 请求上下文
  * @returns {Promise<Response>} HTTP响应
